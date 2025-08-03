@@ -1,0 +1,650 @@
+---
+title: "Molecular signatures underlying heterogeneous hypertrophic responsiveness to resistance trainin in older men and women: a within-subject design"
+author: "Manoel Lixandrao"
+date: today
+format: 
+  html:
+    toc: true
+    self-contained: true
+execute:
+  error: false
+  message: false
+  warning: false
+---
+
+# Install and load libraries
+```{r}
+#| label: install and load libraries
+
+
+# Packages from the Bioconductor
+if(!require(BiocManager)) install.packages("BiocManager")
+if(!require(EnhancedVolcano)) BiocManager::install("EnhancedVolcano")
+if(!require(limma)) BiocManager::install("limma")
+if(!require(Biobase)) BiocManager::install("Biobase")
+if(!require(edgeR)) BiocManager::install("edgeR")
+if(!require(biomaRt)) BiocManager::install("biomaRt")
+if(!require(org.Hs.eg.db)) BiocManager::install("org.Hs.eg.db")
+if(!require(DESeq2)) BiocManager::install("DESeq2")
+if(!require(topGO)) BiocManager::install("topGO")
+if(!require(RISmed)) BiocManager::install("RISmed")
+if(!require(pathview)) BiocManager::install("pathview")
+if(!require(gage)) BiocManager::install("gage")
+if(!require(gageData)) BiocManager::install("gageData")
+if(!require(ReactomePA)) BiocManager::install("ReactomePA")
+if(!require(clusterProfiler)) BiocManager::install("clusterProfiler")
+if(!require(enrichplot)) BiocManager::install("enrichplot")
+if(!require(DOSE)) BiocManager::install("DOSE")
+
+# Packages from the github
+if(!require(PLIER)) devtools::install_github("wgmao/PLIER")
+
+# Packages from the r
+if(!require(ggpubr)) install.packages("ggpubr")
+if(!require(ggsignif)) install.packages("ggsignif")
+if(!require(matrixStats)) install.packages("matrixStats")
+if(!require(matrixStats)) install.packages("matrixStats")
+if(!require(RColorBrewer)) install.packages("RColorBrewer")
+if(!require(gplots)) install.packages("gplots")
+if(!require(ggplot2)) install.packages("ggplot2")
+if(!require(dplyr)) install.packages("dplyr")
+if(!require(tidyverse)) install.packages("tidyverse")
+if(!require(readxl)) install.packages("readxl")
+if(!require(rstatix)) install.packages("rstatix")
+if(!require(kableExtra)) install.packages("kableExtra")
+if(!require(broom)) install.packages("broom")
+if(!require(emmeans)) install.packages("emmeans")
+if(!require(lme4)) install.packages("lme4")
+if(!require(easyPubMed)) install.packages("easyPubMed")
+if(!require(factoextra)) install.packages("factoextra")
+if(!require(gt)) install.packages("gt")
+if(!require(cowplot)) install.packages("cowplot")
+```
+
+# Data
+
+## Load data
+```{r}
+#| label: load data
+
+# List files and load into R environment
+list.files("0_data", full.names = TRUE, pattern = ".Rds") |>
+  walk(\(x) load(x, envir = .GlobalEnv))
+
+# Print objects
+gt::gt(design.data)
+gt::gt(head(gene.list, 20))
+expression.data |> 
+  rownames_to_column("ENSEMBL") |> 
+  (\(x) gt::gt(head(x, 20)))()
+```
+
+## Data wrangling
+```{r}
+#| label: data wrangling
+#| warning: false
+
+# Merge TimePoint and Set into Condition (baseline, post_1set, post_4set) for the RNA sequencing analysis.
+design.data <- design.data |> 
+  mutate(condition = paste(TimePoint, Set, sep = "_"),
+         condition = factor(condition, levels = c("pre_1", "post_1", "post_4"), labels = c("baseline", "post_1set", "post_4set"))) |> 
+  # create a dummyID to input in the voom-limma pipeline (within subject correlation)
+  mutate(dummyId = rep(1:27, 3))
+
+# Set rownames for your design.data 
+rownames(design.data) <- design.data$SubjectID
+
+gt::gt(design.data)
+```
+
+## Data check
+```{r}
+#| label: data check
+# Test if all subjects are in the expression.data. Should return TRUE
+all(rownames(design.data) == colnames(expression.data))
+```
+
+# RNA data (expression matrix)
+
+## Read in count-data and organize sample information
+```{r}
+#| label: counts data
+
+# Read count-data
+x <- DGEList(counts = expression.data)
+
+# Organize sample information
+x$samples$sex <- factor(design.data$Sex[match(rownames(x$samples), rownames(design.data))])
+x$samples$group <- factor(design.data$Group[match(rownames(x$samples), rownames(design.data))])
+x$samples$timepoint <- factor(design.data$TimePoint[match(rownames(x$samples), rownames(design.data))])
+x$samples$condition <- factor(design.data$condition[match(rownames(x$samples), rownames(design.data))])
+x$samples$dummyid <- factor(design.data$dummyId[match(rownames(x$samples), rownames(design.data))])
+
+# Organize gene list and names
+x$genes <- gene.list[match(rownames(x), rownames(gene.list)),]
+```
+
+## Remove low-expressed genes
+```{r}
+#| label: remove low expressed genes
+
+keep.exprs <- filterByExpr(x, group = x$sample$group)
+x <- x[keep.exprs, , keep.lib.sizes=FALSE]
+
+# Check the size of your dataset 
+dim(x)
+```
+
+## Normalizing gene expression distributions
+```{r}
+#| label: Normalizing gene expression
+
+x <- calcNormFactors(x, method = "TMM")
+```
+
+## Annotate to the Ensembl
+```{r}
+#| label: gene to ensembl annotation
+
+# Create a vector with correspond ENSEMBL to ENTREZID - add to the x$genes
+x$genes["ENTREZID"] = mapIds(org.Hs.eg.db,
+                  keys = rownames(x),
+                  column = "ENTREZID",
+                  keytype = "ENSEMBL",
+                  multiVals = "first")
+
+gt::gt(head(x$genes, 20))
+```
+
+## Voom-Limma
+```{r}
+#| label: differential expression analysis
+
+# Create a group variable combining factors (group and condition)
+group <- factor(paste(x$samples$group, x$samples$condition, sep = "."))
+sex <- factor(x$samples$sex)
+
+# Set the model.matrix
+design <- model.matrix(~ 0 + group + sex)
+colnames(design)[1:9] <- levels(group)
+
+# double voom to define the individuals (x$samples$dummyid) as random factor
+## Initiate the voom
+eset <- voom(x, design, plot = TRUE)
+
+## calculate the within-subject correlation
+corfit <- duplicateCorrelation(eset, design, block = x$samples$dummyid)
+
+## run the voom again using the corfit correlation
+eset <- voom(x, design, block = x$samples$dummyid, correlation = corfit$consensus.correlation, plot = TRUE)
+
+## fit the linear model
+fit <- lmFit(eset, design, block = x$samples$dummyid, correlation = corfit$consensus.correlation)
+
+## Create a full mode contrast
+full.mode.contrast <- makeContrasts(
+  
+  # within-group comparison low-responders
+  llBasalVs1 = L1_L4.post_1set-L1_L4.baseline,
+  llBasalVs4 = L1_L4.post_4set-L1_L4.baseline,
+  ll1Vs4 = L1_L4.post_4set-L1_L4.post_1set,
+  
+  # within-group comparison medium-responders
+  lhBasalVs1 = L1_H4.post_1set-L1_H4.baseline,
+  lhBasalVs4 = L1_H4.post_4set-L1_H4.baseline,
+  lh1Vs4 = L1_H4.post_4set-L1_H4.post_1set,
+  
+  # within-group comparison high-responders
+  hhBasalVs1 = H1_H4.post_1set-H1_H4.baseline,
+  hhBasalVs4 = H1_H4.post_4set-H1_H4.baseline,
+  hh1Vs4 = H1_H4.post_4set-H1_H4.post_1set,
+  
+  # Between-group comparison
+  ll1Vslh1 = L1_H4.post_1set-L1_L4.post_1set,
+  ll1Vshh1 = H1_H4.post_1set-L1_L4.post_1set,
+  lh1Vshh1 = H1_H4.post_1set-L1_H4.post_1set,
+  ll4Vslh4 = L1_H4.post_4set-L1_L4.post_4set,
+  ll4Vshh4 = H1_H4.post_4set-L1_L4.post_4set,
+  lh4Vshh4 = H1_H4.post_4set-L1_H4.post_4set,
+  levels = design)
+
+## Initiate the contrast comparisons
+tmp <- contrasts.fit(fit, full.mode.contrast)
+
+## Run the comparisons
+tmp <- eBayes(tmp)
+
+## Print your contrast results
+tmp_results <- decideTests(tmp, p.value = 0.05)
+summary(tmp_results)
+
+## extract the log fold change for every comparison of interst
+llBasalVs1 <- topTreat(tmp, coef = "llBasalVs1", n=Inf)
+llBasalVs4 <- topTreat(tmp, coef = "llBasalVs4", n=Inf)
+ll1Vs4 <- topTreat(tmp, coef = "ll1Vs4", n=Inf)
+
+lhBasalVs1 <- topTreat(tmp, coef = "lhBasalVs1", n=Inf)
+lhBasalVs4 <- topTreat(tmp, coef = "lhBasalVs4", n=Inf)
+lh1Vs4 <- topTreat(tmp, coef = "lh1Vs4", n=Inf)
+
+hhBasalVs1 <- topTreat(tmp, coef = "hhBasalVs1", n=Inf)
+hhBasalVs4 <- topTreat(tmp, coef = "hhBasalVs4", n=Inf)
+hh1Vs4 <- topTreat(tmp, coef = "hh1Vs4", n=Inf)
+
+lh1Vshh1 <- topTreat(tmp, coef = "lh1Vshh1", n=Inf)
+```
+
+## Filter DE genes
+```{r}
+#| label: filter DE genes and change names for tables
+#| results: asis
+
+DE_list <- list(llBasalVs1, llBasalVs4, ll1Vs4, lhBasalVs1, lhBasalVs4, lh1Vs4, hhBasalVs1, hhBasalVs4, hh1Vs4) |> 
+  map(\(x) as.data.frame(x)) |> 
+  map(\(x) x |> mutate(gene_id = rownames(x)) |> 
+      dplyr::select(-ensembl_gene_id) |> 
+      dplyr::select("ENSEMBL ID" = gene_id, "Gene name" = external_gene_name, ENTREZID, "Log fold-change" = logFC, "P-value" = P.Value, "Adjusted P-value" = adj.P.Val)
+      ) |> 
+  set_names(list("llBasalVs1", "llBasalVs4", "ll1Vs4", "lhBasalVs1", "lhBasalVs4", "lh1Vs4", "hhBasalVs1", "hhBasalVs4", "hh1Vs4")) 
+
+# Add labels (gene name) based on the p-values
+DE_list_filtered <-  DE_list |> 
+  map(\(x) x |> arrange(`P-value`) |> 
+        mutate(labels = if_else(`Adjusted P-value` <= 0.05, `Gene name`, NA)))
+
+groups_names <- paste(rep(c("Low-responders", "Medium-responders", "High-responders"), each = 3), c("Baseline vs 1 set", "Baseline vs 4 sets", "1 vs 4 sets"))
+
+DE_list_filtered |>
+  map(\(x) head(x, 20)) |>
+  map2(groups_names, \(x, header) gt(x) |> tab_header(title = header)) 
+  
+```
+
+# Graphics RNAseq
+
+## PCA plot
+```{r}
+#| label: PCA plot
+#| message: false
+
+# Prepare x_pca data.frame
+x_pca <- x$counts |> 
+  as.data.frame() |> 
+  rownames_to_column("Genes") |> 
+  pivot_longer(cols = -Genes, names_to = "ID", values_to = "values") |> 
+  pivot_wider(id_cols = ID, names_from = Genes, values_from = values) |> 
+  column_to_rownames("ID")
+
+# Run PCA
+pca <- prcomp(x_pca, scale. = T, center = T)
+
+# Raw PCA from factoextra package
+fviz_pca_ind(pca)
+
+# Create PCA data.frame
+pca_df <- as.data.frame(pca$x) |> 
+  rownames_to_column("ID") |>
+  left_join(as.data.frame(x$samples) |> rownames_to_column("ID"),, join_by("ID")) |> 
+  mutate(Groups = case_when(group == "L1_L4" ~ "Low-responders",
+                            group == "L1_H4" ~ "Medium-responders",
+                            group == "H1_H4" ~ "High-responders")) |> 
+  mutate(Groups = factor(Groups, levels = c("Low-responders", "Medium-responders", "High-responders")))
+
+# Text configuration for graph
+config_text <- element_text(size = 14, colour = "black", family = "serif")
+
+pca_df |>
+  ggplot(aes(x = PC1, y = PC2, fill = Groups)) +
+  geom_point(shape = 21, size = 3, show.legend = T, alpha = 0.8) +
+  theme_minimal() +
+  labs(x = "PC1 (28.1%)", y = "PC2 (6.7%)", fill = "") + 
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  theme(text = config_text,
+        axis.text = config_text,
+        legend.text = config_text) 
+```
+
+
+## Volcano function 
+```{r}
+#| label: function for volcano plot
+
+fun_volcano <- function(data, title){
+  
+  volcano = EnhancedVolcano(data, 
+                            lab = data$external_gene_name,
+                            x = "logFC",
+                            y = "adj.P.Val",
+                            pCutoff = 0.05,
+                            FCcutoff = 1,
+                            # pCutoffCol = "adj.P.Val",
+                            ylab = bquote(~-Log[10] ~ Adjusted~italic(P)-Values),
+                            title = title,
+                            subtitle = NULL,
+                            axisLabSize = 12,
+                            titleLabSize = 12,
+                            labSize = 3,
+                            caption = NULL,
+                            legendPosition = "NA",
+                            max.overlaps = Inf,
+                            drawConnectors = T,
+                            lengthConnectors = unit(0.05, "npc"),
+                            arrowheads = F,
+                            ylim = c(0, 5))
+  
+  return(volcano)
+}
+```
+
+## Volcano plots
+```{r}
+#| label: volcanos plots
+#| fig-width: 11
+#| fig-height: 8
+
+# Create names
+groups_names <- paste(rep(c("Low-responders", "Medium-responders", "High-responders"), each = 3), c("Baseline vs 1 set", "Baseline vs 4 sets", "1 vs 4 sets")) 
+# map volcano function
+volcano_plots <- map2(list(llBasalVs1, llBasalVs4, ll1Vs4, lhBasalVs1, lhBasalVs4, lh1Vs4, hhBasalVs1, hhBasalVs4, hh1Vs4), groups_names, \(x, y) fun_volcano(x, y))
+
+cowplot:::plot_grid(plotlist = volcano_plots,
+                    labels = LETTERS[1:9],
+                    nrow = 3, 
+                    ncol = 3)
+```
+
+## GO annotation from clusterprofiler
+
+## Function GO over-representation annotation
+```{r}
+#| label: Function GO over-represetantion
+
+fun_go <- function(data, ...){
+  
+  df <- DE_list_filtered[[data]] |> 
+    filter(!is.na(ENTREZID)) |> 
+    filter(`Adjusted P-value` <= 0.05)
+  
+  gene <- df$ENTREZID
+  
+  if(length(gene) >= 1){
+  
+  go <- enrichGO(gene = gene,
+                 universe = DE_list_filtered[[data]][["ENTREZID"]],
+                 OrgDb = org.Hs.eg.db,
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 pvalueCutoff = 0.05,
+                 qvalueCutoff = 0.2,
+                 readable = T)
+  
+  go1 <- go |> 
+    as_tibble() |> 
+    rename("Gene ratio" = GeneRatio, "BG ratio" = BgRatio, "P-value" = pvalue, "Adjusted P-value" = p.adjust, "Q-value" = qvalue, "Gene ID" = geneID)
+  
+  return(go1)
+  
+  } else {
+    
+    return("No genes found")
+    
+  }
+  
+}
+```
+
+## Go-over represetation annotation
+```{r}
+#| label: go annotation
+#| results: asis
+
+# Create names
+go_names <- list("llBasalVs1", "llBasalVs4", "ll1Vs4", "lhBasalVs1", "lhBasalVs4", "lh1Vs4", "hhBasalVs1", "hhBasalVs4", "hh1Vs4")
+
+# map GO function
+go_enrichment_list <- map(go_names, \(x) fun_go(x)) |> 
+  set_names(go_names)
+
+go_enrichment_list |>
+  map(\(x) as.data.frame(x)) |> 
+  map(\(x) head(x, 20)) |> 
+  map2(groups_names, \(x, header) gt(x) |> tab_header(title = header))
+```
+
+# Plier analysis
+
+## Data preparation
+```{r}
+z <- cpm(x, log=TRUE)
+
+# Calculate the means of each row in the dataset
+z.means <- rowMeans(z)
+
+# Select only genes that have a correspondence in the z dataset
+gene <- gene.list[rownames(z), ]
+
+# Applies a function to each item in 1:nrow(z) to find the location of the maximum value.
+ensembl_to_gene <- tapply(1:nrow(z), as.character(gene$external_gene_name), function(i){
+    i[which.max(z.means[i])]})
+
+# Dataset that I'll be working with.
+y <- z[ensembl_to_gene, ]
+
+rownames(y) <- names(ensembl_to_gene)
+```
+
+## Load Plier pathways
+```{r}
+#| label: load plier pathways
+
+# Load dataset
+load("../0_data/MetaMEx_matrix.Rds")
+data(bloodCellMarkersIRISDMAP)
+data(canonicalPathways)
+
+allPaths <- combinePaths(bloodCellMarkersIRISDMAP, canonicalPathways, MetaMEx_matrix)
+```
+
+## Prepare gene and pathway sets
+```{r}
+# Find genes in the pathways that are in our filtered data set
+cm.genes <- commonRows(allPaths, y)
+
+length(cm.genes)
+
+# Normalize expression using z-score
+yN <- PLIER::rowNorm(y)
+yN <- data.frame(yN)
+
+# Compute principal components
+PLIER::num.pc(yN) 
+```
+## Load Plier results
+
+- By loading this, you don't need to re-run the code below.
+
+```{r}
+#| label: load plier results 
+load("./0_data/Plier_results_object_trimmed_final.Rdata")
+```
+
+## Run PLIER 
+```{r}
+#| label: run plier
+#| eval: false
+# Singular value decomposition of a matrix (SVD) decomposition on the same set of genes.
+# Additional information about SVD can be found here: https://web.mit.edu/be.400/www/SVD/Singular_Value_Decomposition.htm
+yN.svd <- svd(yN[cm.genes,])
+
+# Pathway matrix pseudo-inverse . This is used to pre-select pathways for optimization.Chat 
+
+Chat = computeChat(allPaths[cm.genes,])
+
+plierResults <- PLIER(as.matrix(yN[cm.genes, ]), allPaths[cm.genes, ], k=39, svdres=yN.svd, Chat = Chat)
+```
+
+# Plot matrix
+```{r}
+#| label: plot matrix
+
+dim(yN)
+plotU(plierResults, auc.cutoff = 0.70, fdr.cutoff = 0.1, top = 3)
+```
+
+# Interpret PLIER results
+```{r}
+#create a data.frame with the Plier results
+scores <- as.data.frame(t(plierResults$B))
+
+for (i in 1:length(colnames(scores))){
+  colnames(scores)[i] <- paste(c("LV",i), collapse = "")
+}
+
+my.design <- design.data 
+
+scores$Group <- factor(my.design$Group[match(rownames(scores), rownames(my.design))])
+scores$TimePoint <- factor(my.design$TimePoint[match(rownames(scores), rownames(my.design))])
+scores$Set <- factor(my.design$Set[match(rownames(scores), rownames(my.design))])
+scores$Sex <- factor(my.design$Sex[match(rownames(scores), rownames(my.design))])
+scores$subjectID <- rownames(scores)
+
+# Data wrangling for the score dataset
+scores_final <- scores |> 
+  mutate(Group = case_when(Group == "L1_L4" ~ "LL",
+                           Group == "L1_H4" ~ "LH",
+                           Group == "H1_H4" ~ "HH")) |> 
+  mutate(Combined = paste(TimePoint, Set, sep = "_"),
+         Combined = case_when(Combined == "pre_1" ~ "Baseline",
+                              Combined == "post_1" ~ "Post_1set",
+                              Combined == "post_4" ~ "Post_4set")) |> 
+  mutate(ID = as.numeric(map(str_extract_all(subjectID, "[:number:]"), \(x) str_c(x, collapse = ""))))
+
+# Run mixed model analyses for all LVs (n = 39)
+model_RNA <- names(scores_final)[1:39] |> 
+  map(\(x) lmer(formula = as.formula(paste0(x, " ~ Group * Combined + (1 | ID)")), data = scores_final)) |> map(\(x) car::Anova(x, test.statistic = "F")) |> 
+  map_df(\(x) x) |> 
+  mutate(LV = rep(seq(1, 39), each = 3), Effect = rep(c("Group", "Set", "Group:Set"), 39))
+
+# Filter LVs with group:set interaction
+model_rna_df <- model_RNA |> 
+  filter(Effect == "Group:Set" & `Pr(>F)` <= 0.05)
+
+# Select LVs of interest
+LVs <- paste0("LV", model_rna_df[["LV"]])
+
+# Final dataset
+RNAseq_df <- scores_final |> 
+  dplyr::select(ID, Group, Combined, all_of(LVs)) |> 
+  dplyr::rename("Set" = Combined) |> 
+  mutate(Set = case_when(Set == "Baseline" ~ "Baseline",
+                         Set == "Post_1set" ~ "1 Set",
+                         Set == "Post_4set" ~ "4 Sets")) |> 
+  mutate(Set = factor(Set, levels = c("Baseline", "1 Set", "4 Sets"))) |> 
+  mutate(Group = factor(Group, levels = c("LL", "LH", "HH"), labels = c("Low-responders", "Medium-responders", "High-responders"))) |> 
+  arrange(Group, Set)
+
+gt(RNAseq_df)
+```
+
+## Posthoc for significant LVs
+```{r}
+#| label: posthoc significant lvs
+#| message: false
+#| results: asis
+
+# Run mixed model
+model_rna_posthoc <- names(RNAseq_df)[4:10] |>
+  map(\(x) lmer(formula = as.formula(paste(x, "~ Group * Set + (1 | ID)")), data = RNAseq_df)) |> 
+  # map(\(x) car::Anova(x, test.statistic = "F")) |> 
+  set_names(names(RNAseq_df)[4:10]) 
+
+# Run posthoc mixed model
+posthoc_rna <- map(1:7, \(x) emmeans(model_rna_posthoc[[x]], ~ Group * Set, adjust = "tukey")) |>
+  (\(data) map(1:7, \(x) pairs(data[[x]], reverse = T) ))() |> 
+  set_names(names(RNAseq_df)[4:10]) 
+
+# Set confidence interval for the pairwise comparison
+posthoc_rna_ci <- map(1:7, \(x) confint(posthoc_rna[[x]])) |> 
+  set_names(names(RNAseq_df)[4:10])
+
+# Create data frame with the results
+posthoc_final <- posthoc_rna |> 
+  map(\(x) as_tibble(x)) |> 
+  (\(data) map(1:7, \(x) left_join(data[[x]], posthoc_rna_ci[[x]])))() |> 
+  map(\(x) x |> mutate(significance = case_when(p.value <= 0.1 & p.value > 0.05 ~ "NS",
+                                                p.value <= 0.05 ~ "**",
+                                                p.value > 0.05 ~ "NS")) |> 
+      mutate_at(.vars = c(2:8), \(y) round(y, 3)) |> 
+      filter(p.value <= 0.05)) |>  
+  set_names(names(RNAseq_df)[4:10])
+
+# Filtered by p.values <= 0.05
+posthoc_final |> 
+  map(\(x) head(x, 20)) |> 
+  imap(\(x, header) gt(x) |> tab_header(title = header))
+```
+
+# Figures
+
+## LVs of interest
+
+## Figures for the AUC and FDR
+
+- Using this code only to adjust the names from the PLIER matrix
+```{r}
+#| label: figures for the AUC and FDR
+
+# Need to change names from the plierResults$U. 
+rownames(plierResults$U)[rownames(plierResults$U) == "MetaMEx_AcuteResistance"] <- "MetaMex: Acute resistance exercise"
+rownames(plierResults$U)[rownames(plierResults$U) == "REACTOME_METABOLISM_OF_PROTEINS"] <- "REACTOME: Metabolism of proteins"
+rownames(plierResults$U)[rownames(plierResults$U) == "REACTOME_HIV_INFECTION"] <- "REACTOME: HIV infection"
+rownames(plierResults$U)[rownames(plierResults$U) == "KEGG_PROTEASOME"] <- "KEGG: Proteasome"
+rownames(plierResults$U)[rownames(plierResults$U) == "REACTOME_IMMUNE_SYSTEM"] <- "REACTOME: Immune system"
+rownames(plierResults$U)[rownames(plierResults$U) == "MIPS_PA700_20S_PA28_COMPLEX"] <- "MIPS: PA700 20S PA28 complex"
+rownames(plierResults$U)[rownames(plierResults$U) == "REACTOME_CLASS_I_MHC_MEDIATED_ANTIGEN_PROCESSING_PRESENTATION"] <- "REACTOME: Class I MHC mediated antigen processing presentation"
+rownames(plierResults$U)[rownames(plierResults$U) == "MIPS_SPLICEOSOME"] <- "MIPS: Spliceosome"
+rownames(plierResults$U)[rownames(plierResults$U) == "REACTOME_TRANSLATION"] <- "REACTOME: Translation"
+rownames(plierResults$U)[rownames(plierResults$U) == "KEGG_SPLICEOSOME"] <- "KEGG: Spliceosome"
+rownames(plierResults$U)[rownames(plierResults$U) == "REACTOME_METABOLISM_OF_LIPIDS_AND_LIPOPROTEINS"] <- "REACTOME: Metabolism of lipids and lipoproteins"
+rownames(plierResults$U)[rownames(plierResults$U) == "REACTOME_METABOLISM_OF_AMINO_ACIDS_AND_DERIVATIVES"] <- "REACTOME: Metabolism of amino acids and derivatives"
+```
+
+## Heatmap
+```{r}
+#| label: LV - Heatmap
+#| fig-width: 13 
+#| fig-height: 9
+
+# Need to source the custom PLIER function. KL and ML have worked on that.
+source("Functions/PLIER_functions.R")
+
+simpledf <- design_data_temp |> 
+  dplyr::select(SubjectID, Sex, Group, TimePoint, Set) |> 
+  arrange(Group, TimePoint, Set, Sex) |> 
+  mutate(time = factor(paste(TimePoint, Set, sep = "_"))) |> 
+  dplyr::select(Group, Sex, time, SubjectID) |> 
+  rename("Groups"  = Group, "Sex" = Sex, "Condition" = time) |> 
+  mutate(Sex = if_else(Sex == 1, "Female", "Male")) |> 
+  mutate(Condition = factor(Condition, levels = c("pre_1", "post_1", "post_4"), labels = c("Baseline", "1 set", "4 sets"))) |> 
+  mutate(Groups = factor(Groups, levels = c("L1_L4", "L1_H4", "H1_H4"), labels = c("Low-responders", "Medium-responders", "High-responders"))) |> 
+  arrange(Groups, Condition) |> 
+  column_to_rownames("SubjectID")
+
+# Copy data.frame with normalized gene expression
+newyN <- yN[, rownames(simpledf)]
+
+# I prefer to personalize the annotation color here.
+# The colors match all other graphs.
+ann_colors = list(Condition = c(Baseline = "white", `1 set` = "#e2e2e2", `4 sets` = "#a8a8a8"),
+    Sex = c(Female = "red", Male = "blue"),
+    Groups = c(`Low-responders` = "#fdbeb8", `Medium-responders` = "#9bdaa3", `High-responders` = "#b3cefe"),
+    present = c(inPathway = "black", notInPathway = "beige"))
+
+# Run the custom pheatmap
+LV_heatmaps <- LVs |> 
+  map(\(x) gsub("LV", "", x)) |> 
+  map(\(x) x = as.numeric(x)) |> 
+  walk(\(x) ml1.customplotTopZ(plierRes = plierResults, data = newyN[cm.genes, ], priorMat = allPaths[cm.genes, ], top = 50, index = x, allLVs = T, annotation_col = simpledf, width = 30, height = 60, gaps_col = c(27,54), annotation_colors = ann_colors, annotation_legend = T, main = paste0("LV", x))) |> 
+  set_names(LVs)
+```
